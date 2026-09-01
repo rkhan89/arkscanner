@@ -87,7 +87,24 @@ class Database:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.executescript(SCHEMA)
+        self._migrate()
         self.conn.commit()
+
+    def _migrate(self) -> None:
+        """Additive-only schema changes. Existing rows are never rewritten."""
+        columns = {r["name"] for r in self.conn.execute("PRAGMA table_info(tokens)")}
+        if "ingest_source" not in columns:
+            # Where the row came from, as opposed to `source`, which is the venue
+            # the token launched on. Rows captured before PumpPortal came from the
+            # Helius log stream; the DEFAULT makes them read back as such without
+            # an UPDATE touching a single existing row.
+            self.conn.execute(
+                "ALTER TABLE tokens ADD COLUMN ingest_source TEXT NOT NULL"
+                " DEFAULT 'helius_logs'"
+            )
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tokens_ingest ON tokens (ingest_source)"
+            )
 
     def close(self) -> None:
         self.conn.close()
@@ -101,6 +118,7 @@ class Database:
         program_id: str,
         source: str,
         resolution_status: str,
+        ingest_source: str,
         mint: str | None = None,
         name: str | None = None,
         symbol: str | None = None,
@@ -120,8 +138,8 @@ class Database:
             INSERT OR IGNORE INTO tokens (
                 mint, first_seen_utc, slot, name, symbol, uri, deployer,
                 source, program_id, signature, resolution_status,
-                raw_logs, raw_event
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                raw_logs, raw_event, ingest_source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 mint,
@@ -137,6 +155,7 @@ class Database:
                 resolution_status,
                 json.dumps(list(raw_logs)) if raw_logs is not None else None,
                 raw_event,
+                ingest_source,
             ),
         )
         self.conn.commit()
@@ -167,6 +186,12 @@ class Database:
             (status, mint, deployer, block_time_utc, slot, quote_mint, row_id),
         )
         self.conn.commit()
+
+    def counts_by_ingest_source(self) -> dict[str, int]:
+        rows = self.conn.execute(
+            "SELECT ingest_source, COUNT(*) AS n FROM tokens GROUP BY ingest_source"
+        ).fetchall()
+        return {r["ingest_source"]: r["n"] for r in rows}
 
     def counts_by_source(self) -> dict[str, int]:
         rows = self.conn.execute(

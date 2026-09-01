@@ -26,6 +26,7 @@ def main() -> int:
     print(f"database : {config.DB_PATH}")
     print(f"rows     : {total}")
     print(f"by source: {db.counts_by_source() or 'none'}")
+    print(f"by ingest: {db.counts_by_ingest_source() or 'none'}")
 
     statuses = db.conn.execute(
         "SELECT resolution_status, COUNT(*) n FROM tokens GROUP BY resolution_status"
@@ -43,15 +44,17 @@ def main() -> int:
 
     print()
     print(f"last {limit} rows (times in {config.DISPLAY_TZ_NAME}):")
-    header = f"{'seen':<9} {'source':<15} {'mint':<48} {'symbol':<12} {'name':<20} {'status':<9} deployer"
+    header = (f"{'seen':<9} {'ingest':<12} {'source':<15} {'mint':<48} "
+              f"{'symbol':<12} {'name':<20} deployer")
     print(header)
     print("-" * len(header))
     for row in reversed(db.recent(limit)):
         seen = to_display_tz(datetime.fromisoformat(row["first_seen_utc"])).strftime("%H:%M:%S")
         print(
-            f"{seen:<9} {row['source']:<15} {(row['mint'] or '-'):<48} "
+            f"{seen:<9} {row['ingest_source']:<12} {row['source']:<15} "
+            f"{(row['mint'] or '-'):<48} "
             f"{safe(row['symbol'], 11):<12} {safe(row['name'], 19):<20} "
-            f"{row['resolution_status']:<9} {short(row['deployer'])}"
+            f"{short(row['deployer'])}"
         )
 
     db.close()

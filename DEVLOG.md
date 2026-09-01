@@ -485,3 +485,334 @@ firehose needs narrowing. Read the Helius dashboard, divide by the recorded
 message count, set `WS_MESSAGE_CREDIT_COST` to a real number. After that, a long
 unattended run to exercise the reconnect path, which has still never actually
 fired: `reconnects 0` across every run so far.
+
+---
+
+## [2026-09-01] Session 2: Replacing the ingest architecture
+
+**Goal:** The Helius firehose is not affordable. Move ingest to PumpPortal and prove the launch capture rate holds.
+
+**What we built:** The scanner used to listen to every single trade on Solana in order to spot the handful that were new coins being created — about one useful message in every fifteen hundred. That turned out to cost so much that our free monthly allowance would have run out in a day. We swapped it for a free service that only sends the new-coin announcements, so the scanner now receives roughly one message per coin instead of fifteen hundred, and costs nothing.
+
+### The measurement that forced the change
+
+The Helius dashboard, after under an hour of running:
+
+```
+35,989 credits
+  99.3%  LaserStream WebSocket delivery
+   0.7%  RPC
+```
+
+The free tier is 1M credits/month. At that burn rate it is gone in about a day of
+continuous running. Session 1 flagged `WS_MESSAGE_CREDIT_COST` as the single most
+important unknown in the project and defaulted it to zero pending a real reading.
+The real reading came back at roughly **0.01 credits per WebSocket message**, and
+zero was wrong in the direction that mattered.
+
+The 0.7% is the more interesting half. RPC — the `getTransaction` calls — came to
+236 credits for an entire session. **RPC was never the problem. Delivery was.**
+So Helius stays in the project as an RPC client for phase 2 enrichment, and only
+the subscription architecture goes.
+
+### Capturing the payload shape before writing any code
+
+Session 1's worst bug came from assuming a log format. So this time, before a line
+of ingest code changed, ten real payloads were pulled off the PumpPortal socket
+and read.
+
+```
+connected to wss://pumpportal.fun/api/data
+sent: {"method": "subscribeNewToken"}
+  non-token message: {"message": "Successfully subscribed to token creation events."}
+  [ 1/10] 'TeAmo'
+  [ 2/10] 'Killer'
+  ...
+```
+
+One real event, verbatim:
+
+```json
+{
+  "signature": "3vJ8ywXdaJJzP9xP8FBRrEgidxyPCoPfEJG7VbJrcZ1nnZmhVJtt1NiJ2JyyNSQvJ4DyFkwH3eBTkhMMYyVYg8gi",
+  "mint": "Btz83wg2AK3eng1R6HYBYBDie3JmxbbiGmmqj1TZpump",
+  "traderPublicKey": "5MTjkAZMe1ur64ADTgnaYFN1ByTapu2RqcKYUdQNaE2E",
+  "txType": "create",
+  "initialBuy": 97545454.545454,
+  "solAmount": 3,
+  "bondingCurveKey": "3aeLfDXUhz5JVdLxFfPwpmMJV9giPsW4GPjLtEf63jiu",
+  "vTokensInBondingCurve": 975454545.454546,
+  "vSolInBondingCurve": 32.999999999999986,
+  "marketCapSol": 33.830382106244144,
+  "name": "Solana Te Amo",
+  "symbol": "TeAmo",
+  "uri": "https://metadata.j7tracker.io/metadata/DL2kT756b9.json",
+  "is_mayhem_mode": false,
+  "pool": "pump"
+}
+```
+
+What the capture established that documentation would not have:
+
+- 14 fields, all present in all 10 events.
+- **No `slot` and no `blockTime`.** The Helius log stream gave us a slot for free;
+  this does not. Those columns are now null, and deliberately not invented.
+- `initialBuy` and `solAmount` arrive as `int` *or* `float` depending on the value
+  (`"solAmount": 3` in one event, `0.989824717` in another). Anything doing
+  arithmetic on them in phase 2 needs to expect both.
+- `traderPublicKey` is the creator on a `create` event, so it maps to `deployer`.
+- A `{"message": "Successfully subscribed..."}` acknowledgement arrives first and
+  is not a token event.
+
+### Decisions made
+
+**The payload maps onto the existing columns; the schema does not bend to the
+feed.** `signature`, `mint`, `name`, `symbol`, `uri` map directly.
+`traderPublicKey` becomes `deployer`. `pool` becomes `source`. The seven fields
+with no column of their own — `bondingCurveKey`, `initialBuy`, `solAmount`,
+`vTokensInBondingCurve`, `vSolInBondingCurve`, `marketCapSol`, `is_mayhem_mode` —
+go into `raw_event` as the complete original JSON, so nothing is lost and phase 2
+can promote whichever of them turn out to matter.
+
+**One new column, added without touching a single existing row.**
+`ingest_source` distinguishes PumpPortal rows from the 129 Helius rows already
+captured. It went in as `ALTER TABLE ... ADD COLUMN ... NOT NULL DEFAULT
+'helius_logs'`, which means SQLite reports the old rows as `helius_logs` on read
+without rewriting them. No `UPDATE`, no rebuild, no migration of existing data.
+Note this is separate from `source`, which stays what it always was: the venue the
+token launched on, not how we heard about it.
+
+**Do not guess a pool-to-program mapping.** Only pools actually seen on the wire
+get mapped. Anything else is stored under a `pumpportal:<pool>` sentinel and logs
+a warning, rather than being silently attributed to the wrong program. This
+mattered within eight seconds of going live — see below.
+
+**Do not use `mint` to tell an event from an acknowledgement.** The first version
+did, and a test caught it: a create event that lost its `mint` field would have
+been quietly filed as an unrecognised control message. It now keys off the
+presence of any of `txType`/`mint`/`signature`, so a payload that loses a required
+field gets counted as malformed and shouted about instead of disappearing.
+
+**Watchdog retuned from 90s to 600s.** Under Helius this watched a 1,100 msg/sec
+firehose, where 90 seconds of silence was unambiguously a dead socket. PumpPortal
+delivers about 28 creations a minute. Treating arrivals as Poisson, 90s of silence
+at the observed rate has probability e^-42, but the rate is not constant — quiet
+stretches and overnight lulls drop it to a few per minute, and at 2/min a 90s
+watchdog would false-trigger about 5% of the time and reconnect for no reason. At
+600s, even a 1/min rate gives a 0.005% false-trigger probability. The
+protocol-level ping (20s interval, 20s timeout) still catches a genuinely dead TCP
+connection in about 40 seconds, so the longer backstop does not slow down real
+failure detection — it only covers the open-but-not-delivering case.
+
+**Rejected:** narrowing the Helius subscription set to stay under budget. There is
+no subscription narrow enough. The cheapest possible logsSubscribe still delivers
+every trade on whatever program it watches, and the launches are a rounding error
+inside that. The architecture was the cost, not the tuning.
+
+### Errors hit
+
+No new errors this session. The replay test did fail twice, both times because a
+test expectation was wrong rather than the code:
+
+```
+AssertionError: 2
+```
+
+Expected three malformed payloads, got two. That one was worth having: it exposed
+the `mint`-as-discriminator flaw described above, so a wrong test found a real
+weakness. Fixed in the code, not the test.
+
+```
+AssertionError
+  assert db.counts_by_ingest_source() == {"helius_logs": pre_count}
+```
+
+The migration test copies the live database, and by then the live database
+contained PumpPortal rows too, so the expectation of a Helius-only table was
+stale. Fixed in the test.
+
+### The bonk discovery
+
+Eight seconds into the live run:
+
+```
+2026-09-01 18:57:00,700Z WARNING solscanner.ingest unmapped PumpPortal pool 'bonk', stored as 'pumpportal:bonk'
+```
+
+**`subscribeNewToken` is not a pump.fun feed. It covers multiple launchpads.** The
+ten-payload sample happened to contain only `pool: "pump"`, and had that sample
+been treated as the whole truth, this launch would have been silently recorded
+against the pump.fun program. It was not, because unmapped pools get a sentinel.
+
+The `bonk` payload also has a **different shape**:
+
+```json
+{
+  "signature": "pZJ4sWQax8k3yUw2YVACn1irsxHKvNFC5aQKiDPoTcUaZAEAu4zRg4hw5cTRerd5xGdyDXhRjT3VcATLfnPJoVG",
+  "mint": "3ksbqvVHUCSqtCieUYXPrJ2MySNwzqG4bspCBMSqiray",
+  "solInPool": 0.992,
+  "tokensInPool": 965739053.104158,
+  "newTokenBalance": 34260946.895842,
+  "pool": "bonk"
+}
+```
+
+`solInPool` / `tokensInPool` / `newTokenBalance` instead of `bondingCurveKey` /
+`vSolInBondingCurve` / `vTokensInBondingCurve`, and no `is_mayhem_mode`. Any phase
+2 code that reads liquidity out of `raw_event` has to handle both shapes. Storing
+the whole payload rather than a chosen subset is what makes that recoverable.
+
+Rather than guess which program `bonk` means, one `getTransaction` was spent on it:
+
+```
+signature : pZJ4sWQax8k3yUw2YVACn1irsxHKvNFC5aQKiDPo...
+slot      : 443496916  blockTime: 1788289066
+programs invoked:
+   16x  TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA
+   10x  11111111111111111111111111111111
+    4x  LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj  raydium_launchlab
+    2x  ComputeBudget111111111111111111111111111111
+    2x  ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL
+    1x  metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s
+```
+
+letsbonk.fun runs on Raydium LaunchLab, which was already in the program
+catalogue. `bonk` is now mapped, with the signature that proves it recorded in the
+comment. Cost: 1 credit. That is exactly the job the retained Helius RPC client
+exists to do.
+
+The one row captured under the sentinel was corrected to `raydium_launchlab` once
+the venue was verified. That is a correction to a row captured minutes earlier in
+this session, not a migration of the historical Helius rows, which remain
+untouched at 129.
+
+### The 10-minute comparison
+
+```
+  stopped after 9m59s
+  launches captured     : 276 (27.6/min)
+  duplicates ignored    : 0
+  malformed payloads    : 0
+  totals in database    : 405 {'helius_logs': 129, 'pumpportal': 276}
+  helius credits        : rpc_calls=0 ws_msgs=0 est_credits=0 (0.000% of monthly free tier)
+```
+
+| | Helius logsSubscribe | PumpPortal |
+|---|---|---|
+| Launches captured | 129 | 276 |
+| Window | 249 s | 599 s |
+| Rate | 31.1/min | 27.6/min |
+| Messages received | 192,026 | 277 |
+| **Messages per launch** | **1,489** | **1.004** |
+| Helius credits | ~0.01/msg | **0** |
+| Reconnects | 0 | 0 |
+| Duplicates | 0 | 0 |
+
+**Helius credit spend during the PumpPortal run was zero**, confirmed by the meter
+reading `rpc_calls=0 ws_msgs=0 est_credits=0` and by nothing in the ingest path
+holding a Helius connection.
+
+**On the rate difference: 27.6/min versus 31.1/min is an 11% gap, and this data
+cannot tell you whether that gap is real.** The per-minute counts within the
+PumpPortal run alone were:
+
+```
+[31, 23, 32, 36, 21, 27, 31, 21, 24, 30]
+```
+
+21 to 36 launches per minute — a 1.7x spread inside a single ten-minute run. The
+Helius figure comes from a 249-second sample, which is one and a half of those
+buckets. An 11% difference between a 4-minute sample and a 10-minute sample taken
+20 minutes apart sits comfortably inside that variance, so claiming either
+equivalence or a coverage gap from these numbers would be overreading them.
+
+The measurement that would actually settle it: run both ingest paths simultaneously
+against the same wall-clock window and diff the sets of mint addresses. That is a
+real experiment and it is worth doing before the backtest depends on PumpPortal
+being complete, because a feed that silently drops 11% of launches is a
+survivorship problem, and CLAUDE.md is explicit that survivorship bias invalidates
+the whole exercise. Logged as the next task rather than waved through.
+
+### Data quality of the 276 rows
+
+```
+null/empty mint      : 0
+null/empty signature : 0
+null/empty name      : 1
+null/empty symbol    : 1
+null/empty uri       : 0
+null/empty deployer  : 0
+null/empty raw_event : 0
+distinct mints    : 276
+distinct deployers: 211
+slot always null  : True
+```
+
+276 launches, 276 distinct mints, no duplicates. One token launched with an empty
+name and empty symbol (`BAiQT5CLLi5gQGFrcMveFgDEZvVbdbZ26gqPLeeopump`) — stored as
+sent rather than rejected, because an unnamed token is a real observation and quite
+possibly an interesting one.
+
+211 distinct deployers across 276 launches: 65 launches came from wallets that
+launched more than once inside ten minutes. Phase 3's premise again, now with a
+bigger sample.
+
+### Surprises
+
+- **RPC was never the expensive part.** 236 credits for a whole session against 35,753 for delivery. The instinct going into session 1 was to be careful about `getTransaction` calls and relaxed about the subscription. Exactly backwards.
+- **The feed is almost pure signal.** 277 messages produced 276 launches. Against 1,489 messages per launch on Helius, that is a 1,483x reduction in traffic to do the same job.
+- **`subscribeNewToken` spans launchpads.** Expected a pump.fun feed, got pump.fun plus letsbonk plus presumably others not seen in ten minutes. That is more coverage than intended, which is good, but it means `pool` is a field to handle rather than a constant to ignore.
+- **Different launchpads send differently shaped payloads on the same feed.** No version marker, no discriminator, just different keys. Storing the whole payload is the only thing that makes this survivable.
+- **Zero duplicates in 276 events.** Helius redelivered constantly. PumpPortal did not repeat a single signature.
+
+### Content
+
+`[CONTENT]` **The number that killed the architecture.** On screen: the Helius
+dashboard showing `35,989 credits` with the 99.3% / 0.7% split, next to session
+1's status line confidently reporting `est_credits=0 (0.000% of monthly free
+tier)`. The scanner had been reporting zero spend while burning a month's
+allowance in a day, because the provider does not itemise it and the meter
+defaulted to zero pending a real reading. The lesson is not "we got the number
+wrong", it is "we shipped a meter that could only ever have read zero and then
+trusted it".
+
+`[CONTENT]` **1,489 messages per launch, versus 1.004.** On screen: the two status
+lines side by side. Helius: `msgs 231171 (1100.5/s) | creations 184`. PumpPortal:
+`msgs 266 (28.0/min) | launches 265`. Same job, same launches, three orders of
+magnitude difference in traffic. The visual is the raw scroll rate — one is
+unreadable, the other is one line per coin.
+
+`[CONTENT]` **The guess that was refused, eight seconds in.** On screen: the
+warning line `unmapped PumpPortal pool 'bonk', stored as 'pumpportal:bonk'`, then
+the bonk payload with its completely different field names next to the pump
+payload, then the `getTransaction` output showing `4x LanMV9sAd7...
+raydium_launchlab`. The point: the ten-sample capture contained only `pump`, and a
+reasonable person would have hardcoded that. The rule that saved it was written
+because of last session's bug, and it paid out within eight seconds of the first
+live run.
+
+`[CONTENT]` **The honest non-answer on coverage.** 27.6/min versus 31.1/min looks
+like an 11% shortfall and the tempting move is to report it as one. On screen: the
+per-minute bucket list `[31, 23, 32, 36, 21, 27, 31, 21, 24, 30]` — a 1.7x spread
+inside one run — and the observation that the Helius baseline was only 249 seconds
+long. The finding is that the data does not support a conclusion either way, and
+the follow-up is to run both feeds against the same window and diff the mints.
+Worth cutting because "we do not know yet, and here is the experiment that would
+tell us" is the opposite of what this genre usually shows.
+
+`[CONTENT]` **A test that was wrong found a bug that was real.** On screen:
+`AssertionError: 2` where 3 was expected, then the diff that changed the event
+discriminator from "has a mint field" to "has any of txType/mint/signature". The
+failing expectation was mine and the count was fine — but chasing it revealed that
+a create event missing its `mint` would have been silently filed as an
+unrecognised control message and never counted as an error at all.
+
+**Time:** roughly 45 minutes.
+
+**Next:** run Helius logsSubscribe and PumpPortal concurrently for a fixed window
+and diff the captured mint sets, to establish whether PumpPortal misses launches.
+That is a bounded experiment with a known cost — one short Helius run, a few
+thousand credits — and it needs settling before phase 5 treats this feed as a
+complete record. After that, a long unattended run to finally exercise the
+reconnect path, which has still never fired: `reconnects 0` across every run in
+both sessions.

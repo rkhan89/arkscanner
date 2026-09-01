@@ -42,8 +42,17 @@ def _get_float(name: str, default: float) -> float:
 
 HELIUS_API_KEY = _get("HELIUS_API_KEY", "")
 
-HELIUS_WS_URL = f"wss://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+# Helius is no longer used for ingest. The logsSubscribe firehose was measured at
+# 35,989 credits in under an hour (99.3% of it WebSocket delivery), which burns
+# the 1M/month free tier in well under a day. Ingest now comes from PumpPortal.
+# The RPC endpoint stays: it cost 236 credits for a whole session and phase 2
+# enrichment needs it.
 HELIUS_RPC_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+
+# PumpPortal: free, no key, no auth, creation events only rather than every
+# trade on the program.
+PUMPPORTAL_WS_URL = _get("PUMPPORTAL_WS_URL", "wss://pumpportal.fun/api/data")
+PUMPPORTAL_SUBSCRIBE_METHOD = "subscribeNewToken"
 
 DB_PATH = PROJECT_ROOT / _get("DB_PATH", "scanner.db")
 LOG_DIR = PROJECT_ROOT / "logs"
@@ -64,7 +73,21 @@ RESOLVER_QUEUE_MAX = _get_int("RESOLVER_QUEUE_MAX", 500)
 RPC_TIMEOUT_SECONDS = _get_float("RPC_TIMEOUT_SECONDS", 20.0)
 
 STATUS_INTERVAL_SECONDS = _get_int("STATUS_INTERVAL_SECONDS", 30)
-WS_SILENCE_TIMEOUT_SECONDS = _get_int("WS_SILENCE_TIMEOUT_SECONDS", 90)
+
+# Silence watchdog. Under Helius this watched a ~1,100 msg/sec firehose and 90s
+# of silence was unambiguously a dead socket. PumpPortal delivers creations only,
+# measured at roughly 30/min, so the maths changed completely.
+#
+# Treating arrivals as Poisson at the observed 31/min, 90s of silence has a
+# probability of e^-46, but the rate is not constant: overnight and during quiet
+# stretches it can fall to a few per minute. At 2/min, 90s of genuine silence
+# happens about 5% of the time, so a 90s watchdog would reconnect constantly for
+# no reason. At 600s, even a 1/min rate gives P(silence) = e^-10 = 0.005%.
+#
+# 600s is the backstop for a socket that is open but not delivering. The
+# protocol-level ping (20s interval, 20s timeout) still catches a genuinely dead
+# TCP connection in about 40s, so this being long does not delay that.
+WS_SILENCE_TIMEOUT_SECONDS = _get_int("WS_SILENCE_TIMEOUT_SECONDS", 600)
 WS_PING_INTERVAL_SECONDS = _get_int("WS_PING_INTERVAL_SECONDS", 20)
 WS_PING_TIMEOUT_SECONDS = _get_int("WS_PING_TIMEOUT_SECONDS", 20)
 
@@ -74,10 +97,13 @@ BACKOFF_FACTOR = _get_float("BACKOFF_FACTOR", 2.0)
 # A connection that survives this long is considered healthy: reset the backoff.
 BACKOFF_RESET_AFTER_SECONDS = _get_float("BACKOFF_RESET_AFTER_SECONDS", 60.0)
 
-# Estimated Helius credits per WebSocket notification.
-# UNVERIFIED. Helius does not itemise WebSocket usage in the response, so this
-# is a local estimate only. Check the dashboard after an hour and correct it.
-WS_MESSAGE_CREDIT_COST = _get_float("WS_MESSAGE_CREDIT_COST", 0.0)
+# Estimated Helius credits per Helius WebSocket notification. This is now dead
+# in practice because ingest no longer holds a Helius WebSocket, but the figure
+# is recorded for the record: the dashboard showed 35,989 credits in under an
+# hour, 99.3% of it WebSocket delivery, which works out at roughly 0.01 credits
+# per message at the observed 1,100 msg/sec. PumpPortal messages are not billed
+# by anyone and are metered at zero.
+WS_MESSAGE_CREDIT_COST = _get_float("WS_MESSAGE_CREDIT_COST", 0.01)
 # getTransaction is a standard RPC call: 1 credit each on the free tier.
 RPC_CALL_CREDIT_COST = _get_float("RPC_CALL_CREDIT_COST", 1.0)
 
@@ -149,6 +175,36 @@ QUOTE_MINTS = {
     "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": "USDC",
     "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB": "USDT",
 }
+
+
+# How a PumpPortal 'pool' value maps onto the existing source / program_id
+# columns. Only pools actually observed on the wire are listed. An unrecognised
+# pool gets a sentinel rather than a guess, and logs a warning: guessing a
+# mapping from documentation is what produced the last data-quality bug.
+PUMPPORTAL_POOL_MAP: dict[str, tuple[str, str]] = {
+    "pump": ("pumpfun", PROGRAM_CATALOGUE["pumpfun"].program_id),
+    # Confirmed by getTransaction on a captured 'bonk' launch rather than assumed:
+    # signature pZJ4sWQax8k3... invoked LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj
+    # four times. letsbonk.fun runs on Raydium LaunchLab. Cost: 1 credit.
+    "bonk": ("raydium_launchlab", PROGRAM_CATALOGUE["raydium_launchlab"].program_id),
+}
+
+# Ingest provenance, recorded per row so PumpPortal rows stay distinguishable
+# from the rows captured earlier through the Helius log stream.
+INGEST_HELIUS_LOGS = "helius_logs"
+INGEST_PUMPPORTAL = "pumpportal"
+
+
+def venue_for_pool(pool: str | None) -> tuple[str, str, bool]:
+    """(source, program_id, recognised) for a PumpPortal pool value."""
+    key = (pool or "").strip() or "unknown"
+    mapped = PUMPPORTAL_POOL_MAP.get(key)
+    if mapped is not None:
+        return mapped[0], mapped[1], True
+    # Deterministic sentinel: keeps the (signature, program_id) dedupe working
+    # and makes the unmapped pool obvious in the data instead of silently
+    # attributing it to the wrong program.
+    return f"pumpportal:{key}", f"pumpportal:{key}", False
 
 
 def active_programs() -> list[WatchedProgram]:

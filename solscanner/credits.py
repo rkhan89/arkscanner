@@ -6,13 +6,21 @@ minutes instead of on the dashboard three weeks later.
 
 Free tier is 1,000,000 credits/month and 10 requests/second.
 
-What is known vs assumed:
-  - A standard JSON-RPC call such as getTransaction is billed. We count it as
-    1 credit each (config.RPC_CALL_CREDIT_COST).
-  - WebSocket notification billing is NOT itemised anywhere we can read, so the
-    default cost per message is 0 (config.WS_MESSAGE_CREDIT_COST) and the
-    message count is tracked separately. Compare the message count against your
-    Helius dashboard after an hour of running and set the real figure.
+Measured, not assumed: the Helius dashboard reported 35,989 credits in under an
+hour of logsSubscribe running - 99.3% of it WebSocket delivery, 0.7% RPC. At the
+observed ~1,100 msg/sec that is roughly 0.01 credits per WebSocket message, and
+it exhausts the 1M/month free tier in under a day. That measurement is why ingest
+moved to PumpPortal.
+
+What remains:
+  - A standard JSON-RPC call such as getTransaction is billed at 1 credit
+    (config.RPC_CALL_CREDIT_COST). RPC was 0.7% of the bill - 236 credits for a
+    whole session - so phase 2 enrichment on Helius RPC is affordable.
+  - Ingest no longer holds a Helius WebSocket, so this meter should now report
+    zero for a phase 1 run. If it does not, something is calling Helius that
+    should not be.
+  - PumpPortal is free and unmetered. Its messages are counted for rate
+    monitoring but carry no credit cost.
 """
 
 from __future__ import annotations

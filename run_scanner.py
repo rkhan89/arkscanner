@@ -34,17 +34,15 @@ def setup_logging() -> None:
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
-def check_credentials() -> bool:
-    missing = config.missing_credentials()
-    if not missing:
-        return True
-    print("Cannot start: missing credentials in .env")
-    for name in missing:
-        print(f"  - {name} is empty")
-    print()
-    print("Open .env, paste the value in, save, and run this again.")
-    print("Nothing else in the project reads a key from anywhere else.")
-    return False
+def check_credentials() -> None:
+    """Ingest needs no credentials at all now that it runs off PumpPortal, which
+    is free and unauthenticated. A missing Helius key is therefore a warning, not
+    a blocker: it only matters once phase 2 enrichment starts making RPC calls."""
+    if config.missing_credentials():
+        print("Note: HELIUS_API_KEY is empty.")
+        print("  Ingest does not need it - PumpPortal is free and unauthenticated.")
+        print("  Phase 2 enrichment will need it.")
+        print()
 
 
 async def main_async() -> int:
@@ -89,15 +87,7 @@ def main() -> int:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
     setup_logging()
-
-    try:
-        config.active_programs()
-    except ValueError as exc:
-        print(f"Configuration error: {exc}")
-        return 2
-
-    if not check_credentials():
-        return 1
+    check_credentials()
 
     try:
         return asyncio.run(main_async())
