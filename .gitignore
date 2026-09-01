@@ -28,3 +28,7 @@ venv/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Runtime control files
+soak.pid
+STOP

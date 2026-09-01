@@ -49,12 +49,22 @@ HELIUS_API_KEY = _get("HELIUS_API_KEY", "")
 # enrichment needs it.
 HELIUS_RPC_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
 
+# For tools/feed_diff.py ONLY. Nothing in the ingest path may open this: holding
+# it is what cost 35,989 credits in under an hour.
+HELIUS_WS_URL = f"wss://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+
 # PumpPortal: free, no key, no auth, creation events only rather than every
 # trade on the program.
 PUMPPORTAL_WS_URL = _get("PUMPPORTAL_WS_URL", "wss://pumpportal.fun/api/data")
 PUMPPORTAL_SUBSCRIBE_METHOD = "subscribeNewToken"
 
 DB_PATH = PROJECT_ROOT / _get("DB_PATH", "scanner.db")
+
+# Creating this file asks a running scanner to shut down cleanly. A detached
+# background process has no console, so Ctrl+C and Ctrl+Break cannot reach it;
+# without this the only way to stop an overnight run would be a force kill,
+# which loses the run summary and the final credit flush.
+STOP_FILE = PROJECT_ROOT / _get("STOP_FILE", "STOP")
 LOG_DIR = PROJECT_ROOT / "logs"
 LOG_PATH = LOG_DIR / "scanner.log"
 LOG_LEVEL = _get("LOG_LEVEL", "INFO").upper()
@@ -97,13 +107,12 @@ BACKOFF_FACTOR = _get_float("BACKOFF_FACTOR", 2.0)
 # A connection that survives this long is considered healthy: reset the backoff.
 BACKOFF_RESET_AFTER_SECONDS = _get_float("BACKOFF_RESET_AFTER_SECONDS", 60.0)
 
-# Estimated Helius credits per Helius WebSocket notification. This is now dead
-# in practice because ingest no longer holds a Helius WebSocket, but the figure
-# is recorded for the record: the dashboard showed 35,989 credits in under an
-# hour, 99.3% of it WebSocket delivery, which works out at roughly 0.01 credits
-# per message at the observed 1,100 msg/sec. PumpPortal messages are not billed
-# by anyone and are metered at zero.
-WS_MESSAGE_CREDIT_COST = _get_float("WS_MESSAGE_CREDIT_COST", 0.01)
+# Helius WebSocket delivery is billed by VOLUME, not per message: the published
+# rate for LaserStream WSS (standard Solana methods) is 2 credits per 0.1 MB of
+# uncompressed streamed data. Session 2 priced it per message, which was the
+# wrong unit. PumpPortal is not billed by anyone.
+WS_CREDITS_PER_CHUNK = _get_float("WS_CREDITS_PER_CHUNK", 2.0)
+WS_BILLED_CHUNK_BYTES = _get_float("WS_BILLED_CHUNK_BYTES", 100_000.0)
 # getTransaction is a standard RPC call: 1 credit each on the free tier.
 RPC_CALL_CREDIT_COST = _get_float("RPC_CALL_CREDIT_COST", 1.0)
 

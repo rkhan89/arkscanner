@@ -53,6 +53,33 @@ CREATE TABLE IF NOT EXISTS credit_usage (
 
 CREATE INDEX IF NOT EXISTS idx_credit_ts ON credit_usage (ts_utc);
 
+-- Connection lifecycle, so an unattended overnight run leaves a readable
+-- timeline: what dropped, why, and how long it took to come back.
+CREATE TABLE IF NOT EXISTS connection_events (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts_utc           TEXT NOT NULL,
+    run_id           INTEGER,
+    event            TEXT NOT NULL,
+    cause            TEXT,
+    downtime_seconds REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_conn_ts ON connection_events (ts_utc);
+
+-- Every distinct set of field names seen per launchpad. A launchpad sending a
+-- shape we have not seen before is a thing to be told about, not a thing to
+-- discover months later in the backtest.
+CREATE TABLE IF NOT EXISTS payload_shapes (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    first_seen_utc    TEXT NOT NULL,
+    pool              TEXT NOT NULL,
+    field_signature   TEXT NOT NULL,
+    example_signature TEXT,
+    example_raw       TEXT,
+    seen_count        INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (pool, field_signature)
+);
+
 CREATE TABLE IF NOT EXISTS runs (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     started_utc    TEXT NOT NULL,
@@ -225,6 +252,63 @@ class Database:
             (since_utc,),
         ).fetchone()
         return float(row[0])
+
+    # -- connection timeline ------------------------------------------------
+
+    def record_connection_event(
+        self,
+        event: str,
+        *,
+        run_id: int | None = None,
+        cause: str | None = None,
+        downtime_seconds: float | None = None,
+    ) -> None:
+        self.conn.execute(
+            "INSERT INTO connection_events (ts_utc, run_id, event, cause, downtime_seconds)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (utcnow_iso(), run_id, event, cause, downtime_seconds),
+        )
+        self.conn.commit()
+
+    def connection_events(self, run_id: int | None = None) -> list[sqlite3.Row]:
+        if run_id is None:
+            return self.conn.execute(
+                "SELECT * FROM connection_events ORDER BY id"
+            ).fetchall()
+        return self.conn.execute(
+            "SELECT * FROM connection_events WHERE run_id = ? ORDER BY id", (run_id,)
+        ).fetchall()
+
+    # -- payload shapes -----------------------------------------------------
+
+    def note_payload_shape(
+        self, pool: str, fields: list[str], signature: str, raw: str
+    ) -> bool:
+        """Record that this launchpad sent this set of field names.
+
+        Returns True the first time a (pool, shape) pair is seen, so the caller
+        can make noise about it exactly once.
+        """
+        field_signature = ",".join(sorted(fields))
+        cur = self.conn.execute(
+            "INSERT OR IGNORE INTO payload_shapes"
+            " (first_seen_utc, pool, field_signature, example_signature, example_raw)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (utcnow_iso(), pool, field_signature, signature, raw),
+        )
+        is_new = bool(cur.rowcount)
+        self.conn.execute(
+            "UPDATE payload_shapes SET seen_count = seen_count + 1"
+            " WHERE pool = ? AND field_signature = ?",
+            (pool, field_signature),
+        )
+        self.conn.commit()
+        return is_new
+
+    def payload_shapes(self) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM payload_shapes ORDER BY first_seen_utc"
+        ).fetchall()
 
     # -- runs ---------------------------------------------------------------
 

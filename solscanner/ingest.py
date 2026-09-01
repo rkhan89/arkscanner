@@ -85,9 +85,14 @@ class Scanner:
         self.unknown_pool = 0
         self.other_messages = 0
         self.reconnects = 0
+        self.watchdog_fires = 0
+        self.total_downtime = 0.0
+        self.new_shapes = 0
+        self.quote_mint_events = 0
         self.subscribed = False
         self.run_id: int | None = None
 
+        self._down_since: float | None = None
         self._stop = asyncio.Event()
 
     # -- lifecycle ----------------------------------------------------------
@@ -145,6 +150,12 @@ class Scanner:
         print(f"  malformed payloads    : {self.malformed}")
         print(f"  totals in database    : {self.db.total_tokens()} "
               f"{self.db.counts_by_ingest_source()}")
+        print(f"  reconnects            : {self.reconnects} "
+              f"(total downtime {self.total_downtime:.1f}s)")
+        print(f"  silence watchdog fires: {self.watchdog_fires}")
+        print(f"  new payload shapes    : {self.new_shapes}")
+        print(f"  suspect quote mints   : {self.quote_mint_events}")
+        print(f"  launchpad breakdown   : {self.db.counts_by_source()}")
         print(f"  helius credits        : {self.meter.summary()}")
         print("=" * 78)
 
@@ -160,14 +171,22 @@ class Scanner:
                 raise
             except Exception as exc:
                 lived = time.monotonic() - connected_at
-                log.warning(
-                    "websocket dropped after %.0fs: %s: %s",
-                    lived,
-                    type(exc).__name__,
-                    config.redact(str(exc)),
+                self._down_since = time.monotonic()
+                cause = f"{type(exc).__name__}: {config.redact(str(exc))}"[:300]
+                is_watchdog = isinstance(exc, ConnectionError) and "no messages for" in str(exc)
+                event = "watchdog_fired" if is_watchdog else "disconnected"
+                log.warning("websocket %s after %.0fs: %s", event, lived, cause)
+                self.db.record_connection_event(
+                    event, run_id=self.run_id, cause=cause, downtime_seconds=None
                 )
-                print(f"[{now_display()}] connection lost ({type(exc).__name__}), "
-                      f"reconnecting in {delay:.0f}s")
+                if is_watchdog:
+                    self.watchdog_fires += 1
+                    print(f"[{now_display()}] SILENCE WATCHDOG FIRED after "
+                          f"{config.WS_SILENCE_TIMEOUT_SECONDS}s with no messages "
+                          f"(connection had been up {lived:.0f}s)")
+                else:
+                    print(f"[{now_display()}] connection lost after {lived:.0f}s "
+                          f"({type(exc).__name__}), reconnecting in {delay:.0f}s")
                 if lived >= config.BACKOFF_RESET_AFTER_SECONDS:
                     # The connection was healthy; this is a one-off drop, not an
                     # endpoint problem. Start the backoff from scratch.
@@ -190,7 +209,18 @@ class Scanner:
             open_timeout=30,
         ) as ws:
             await ws.send(json.dumps({"method": config.PUMPPORTAL_SUBSCRIBE_METHOD}))
-            print(f"[{now_display()}] connected, sent {config.PUMPPORTAL_SUBSCRIBE_METHOD}")
+            downtime = None
+            if self._down_since is not None:
+                downtime = time.monotonic() - self._down_since
+                self._down_since = None
+                print(f"[{now_display()}] RECONNECTED after {downtime:.1f}s down "
+                      f"(reconnect #{self.reconnects})")
+                self.total_downtime += downtime
+            else:
+                print(f"[{now_display()}] connected, sent {config.PUMPPORTAL_SUBSCRIBE_METHOD}")
+            self.db.record_connection_event(
+                "connected", run_id=self.run_id, downtime_seconds=downtime
+            )
             while not self._stop.is_set():
                 try:
                     raw = await asyncio.wait_for(
@@ -265,6 +295,35 @@ class Scanner:
                 "unmapped PumpPortal pool %r, stored as %r", event.get("pool"), source
             )
 
+        # Tell us the first time a launchpad sends a set of field names we have
+        # not seen before. The bonk payload already differs from the pump one;
+        # a third shape must not slip by unnoticed.
+        raw_json = json.dumps(event, separators=(",", ":"))
+        pool = str(event.get("pool") or "unknown")
+        if self.db.note_payload_shape(pool, list(event.keys()), event["signature"], raw_json):
+            self.new_shapes += 1
+            known = sorted(event.keys())
+            log.warning("NEW PAYLOAD SHAPE for pool %r: %s (sig %s)", pool, known, event["signature"])
+            print(f"[{now_display()}] NEW PAYLOAD SHAPE for pool '{pool}': {known}")
+            print(f"{'':11}  raw event stored in payload_shapes and in the row's raw_event")
+
+        # PumpPortal has been observed reporting the QUOTE asset in the `mint`
+        # field on a USDC-quoted LaunchLab launch (sig 3JcSFboMVNfd..., reported
+        # mint = USDC, actual new mint = 6wZEEcfoMLEjFhMQyckgESYdzPBsdKxmHPWzP4oVMEMe).
+        # Flagged, NOT filtered: dropping or rewriting these is a decision for
+        # the operator, and phase 1 does not filter. The row is stored as sent.
+        if event["mint"] in config.QUOTE_MINTS:
+            self.quote_mint_events += 1
+            log.error(
+                "SUSPECT MINT: create event reports quote asset %s (%s) as the new "
+                "token, pool=%r sig=%s - stored unfiltered, verify before use",
+                event["mint"], config.QUOTE_MINTS[event["mint"]], event.get("pool"),
+                event["signature"],
+            )
+            print(f"[{now_display()}] SUSPECT MINT: feed reported "
+                  f"{config.QUOTE_MINTS[event['mint']]} as a new token "
+                  f"(sig {short(event['signature'], 6, 6)}) - stored unfiltered")
+
         deployer = event.get("traderPublicKey")
         row_id = self.db.insert_token(
             signature=event["signature"],
@@ -283,7 +342,7 @@ class Scanner:
             raw_logs=None,
             # Everything the feed sent, including the bonding-curve and initial
             # buy figures that have no column yet.
-            raw_event=json.dumps(event, separators=(",", ":")),
+            raw_event=raw_json,
         )
         if row_id is None:
             self.duplicates += 1
@@ -308,6 +367,12 @@ class Scanner:
     async def _status_loop(self) -> None:
         while not self._stop.is_set():
             await asyncio.sleep(config.STATUS_INTERVAL_SECONDS)
+            if config.STOP_FILE.exists():
+                # The documented way to stop a detached overnight run.
+                print(f"[{now_display()}] {config.STOP_FILE.name} file found, shutting down")
+                log.info("stop file found, shutting down")
+                self.stop()
+                return
             self.meter.flush()
             if self.run_id is not None:
                 self.db.update_run(
@@ -326,5 +391,8 @@ class Scanner:
                 f"dupes {self.duplicates} | malformed {self.malformed} | "
                 f"other {self.other_messages} | "
                 f"db total {self.db.total_tokens()} [{breakdown}] | "
-                f"reconnects {self.reconnects} | {self.meter.summary()}"
+                f"reconnects {self.reconnects} (down {self.total_downtime:.0f}s) | "
+                f"watchdog {self.watchdog_fires} | shapes {self.new_shapes} | "
+                f"suspect {self.quote_mint_events} | "
+                f"{self.meter.summary()}"
             )

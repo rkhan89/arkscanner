@@ -89,6 +89,11 @@ def main() -> int:
     setup_logging()
     check_credentials()
 
+    # A stale stop file from a previous run would kill this one immediately.
+    if config.STOP_FILE.exists():
+        config.STOP_FILE.unlink()
+        print(f"removed stale {config.STOP_FILE.name} file from a previous run")
+
     try:
         return asyncio.run(main_async())
     except KeyboardInterrupt:

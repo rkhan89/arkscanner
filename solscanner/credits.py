@@ -21,6 +21,14 @@ What remains:
     should not be.
   - PumpPortal is free and unmetered. Its messages are counted for rate
     monitoring but carry no credit cost.
+
+WebSocket delivery is billed BY VOLUME, not per message: the Helius docs price
+LaserStream WSS (standard Solana methods) at 2 credits per 0.1 MB of uncompressed
+streamed data. Session 2 estimated it per message, which was the wrong unit and
+happened to land near the right answer. Byte counting is what this meter does now.
+
+There is no documented public endpoint for reading credit balance; the dashboard
+is the authority. Everything here is a local estimate from the published rate.
 """
 
 from __future__ import annotations
@@ -42,6 +50,7 @@ class CreditMeter:
         self._pending_credits: dict[str, float] = defaultdict(float)
         self.session_calls: dict[str, int] = defaultdict(int)
         self.session_credits = 0.0
+        self.ws_bytes = 0
 
     def record(self, method: str, calls: int = 1, credit_cost: float | None = None) -> None:
         cost = config.RPC_CALL_CREDIT_COST if credit_cost is None else credit_cost
@@ -51,10 +60,11 @@ class CreditMeter:
         self.session_calls[method] += calls
         self.session_credits += credits
 
-    def record_ws_message(self, count: int = 1) -> None:
-        self.record(
-            "logsNotification", calls=count, credit_cost=config.WS_MESSAGE_CREDIT_COST
-        )
+    def record_ws_bytes(self, num_bytes: int) -> None:
+        """Helius WebSocket delivery, billed at 2 credits per 0.1 MB."""
+        self.ws_bytes += num_bytes
+        credits = num_bytes / config.WS_BILLED_CHUNK_BYTES * config.WS_CREDITS_PER_CHUNK
+        self.record("wsDelivery", calls=1, credit_cost=credits)
 
     def flush(self) -> None:
         """Write the accumulated counts to the credit_usage table."""
@@ -65,16 +75,17 @@ class CreditMeter:
                 method,
                 calls,
                 self._pending_credits[method],
-                note="local estimate" if method == "logsNotification" else None,
+                note="local estimate" if method == "wsDelivery" else None,
             )
         self._pending_calls.clear()
         self._pending_credits.clear()
 
     def summary(self) -> str:
-        rpc_calls = sum(n for m, n in self.session_calls.items() if m != "logsNotification")
-        ws_messages = self.session_calls.get("logsNotification", 0)
+        rpc_calls = sum(n for m, n in self.session_calls.items() if m != "wsDelivery")
+        ws_messages = self.session_calls.get("wsDelivery", 0)
         pct = 100.0 * self.session_credits / FREE_TIER_MONTHLY_CREDITS
         return (
             f"rpc_calls={rpc_calls} ws_msgs={ws_messages} "
+            f"ws_mb={self.ws_bytes / 1_000_000:.1f} "
             f"est_credits={self.session_credits:.0f} ({pct:.3f}% of monthly free tier)"
         )
