@@ -1,0 +1,14 @@
+# Phase 1 (ingest) dependencies only. Later phases will add to this file.
+
+# Solana JSON-RPC WebSocket client (logsSubscribe). >=13.0 for the
+# websockets.asyncio.client API; the pre-13 legacy client is deprecated.
+websockets>=13.0
+
+# Loads credentials from .env. Nothing is ever hardcoded.
+python-dotenv>=1.0.1
+
+# HTTP client for Helius JSON-RPC calls (getTransaction resolution).
+httpx>=0.27.0
+
+# Base58 encode/decode for Solana pubkeys pulled out of raw event data.
+base58>=2.1.1
