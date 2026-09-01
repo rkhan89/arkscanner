@@ -816,3 +816,267 @@ thousand credits — and it needs settling before phase 5 treats this feed as a
 complete record. After that, a long unattended run to finally exercise the
 reconnect path, which has still never fired: `reconnects 0` across every run in
 both sessions.
+
+---
+
+## [2026-09-01] Session 3: Does PumpPortal drop launches, and does reconnect work
+
+**Goal:** Settle the coverage question left open in session 2, then leave the scanner running unattended overnight to exercise reconnect logic that has never once fired.
+
+**What we built:** We ran the old expensive data source and the new free one side by side for half an hour, then checked every coin that one saw and the other did not against the blockchain itself, to find out whether the cheap source is quietly missing things. It is, by about six percent. We also made the scanner survive the laptop's terminal being closed, gave it a way to be shut down cleanly without one, and deliberately broke its connection over and over to prove it recovers.
+
+### TASK A: the answer is yes, and it matters
+
+Both feeds, same wall-clock window, 30 minutes, separate database, every discrepancy verified on chain.
+
+```
+  window        : 2026-09-01T19:19:40.147+00:00  ->  2026-09-01T19:49:50.168+00:00
+  pumpportal observations : 999
+  helius observations     : 1052
+
+  captured by both           : 992
+  pumpportal only            : 7
+  helius only                : 60
+
+  helius-only signatures examined : 60
+    verified genuine creations    : 60
+    NOT creations (false positive): 0
+  => launches PumpPortal genuinely missed: 60
+```
+
+**PumpPortal missed 60 of the 1,059 launches in the union. That is a 5.7% miss
+rate, and every single one of the 60 was verified as a real token creation.**
+
+The verification is the part that matters. Session 1 proved that counting Helius
+log matches without checking them produces nonsense — 231 of 565 rows were
+swaps. So `diff_report.py` does not trust either feed's word for it. A signature
+counts as a launch only if the transaction contains an `initializeMint` or
+`initializeMint2` instruction, which is the operation that actually brings a token
+into existence. Sixty out of sixty passed. There is no wriggle room in the result:
+this is not a false-positive artefact, PumpPortal did not deliver these.
+
+Sample of what was missed, with the on-chain evidence:
+
+```
+21vbNm22cAPbXu9sc5hqQkJS2kBzQMJBkgWTdjY4pump  pumpfun, raydium_amm_v4
+  https://solscan.io/tx/2KWDM1iNnhNzXQW4hbypHA3bD6TodNgHTVvNxbJzJEqJCt7FtSoFEGspMyLfbqPmZEHzsJ6sD5HbsCkfi1ZbFmPK
+3hVyBgJMk8SFisN7DTAxTVoHkNQtthj892EUmnfuXVbm  pumpfun
+  https://solscan.io/tx/5Nusk1U9pMCFAPPjb3x58qSdBoaBr1JMbHF8YhT9vr71g7DV7W8BreSwUHpFcXBCrRP2vvWXsv7ByLT8mkhP7u3m
+```
+
+Cost of the answer:
+
+```
+  helius volume : 1,366,837 messages, 1595.3 MB
+  helius cost   : ~31,907 credits (2 per 0.1MB, published rate)
+  verification  : 67 getTransaction calls = ~67 credits
+```
+
+About 31,970 credits against a 36,000 budget. The byte-based estimate is now the
+right unit — see the correction below.
+
+**The 5.7% figure is probably optimistic, and it is important to say why.** The
+Helius side of the comparison only watched two programs, pump.fun and Raydium
+LaunchLab, and its LaunchLab detection is demonstrably weak: PumpPortal caught 6
+LaunchLab launches that Helius did not, because the LaunchLab creation marker does
+not reliably match. So the real universe of launches in that window is larger than
+the 1,059 we could see, and PumpPortal's true coverage is at best 94.3%, probably
+lower. What can be said with confidence is a floor: **at least 5.7% of launches are
+missing, and the real number is not smaller.**
+
+That is a survivorship problem. CLAUDE.md is explicit that a dataset which excludes
+tokens is not a valid sample, and 1 in 18 launches silently absent is exactly that.
+Bringing it to you rather than acting on it.
+
+### The USDC row
+
+While diffing, one PumpPortal-only mint stood out:
+
+```
+pumpportal-only mints (7), sample:
+    7eNa9TPoR9fv6mSFgY844CDCLcdnyEpbyqEME7jFbonk
+    ...
+    EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+```
+
+`EPjFWdd5...` is USDC. PumpPortal sent a `create` event claiming USDC is a newly
+launched token called MEMEX:
+
+```json
+{
+  "txType": "create",
+  "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+  "tokensInPool": 197.871725,
+  "solAmount": 0,
+  "newTokenBalance": 0,
+  "name": "MEMEx",
+  "symbol": "MEMEX",
+  "pool": "bonk"
+}
+```
+
+The chain says otherwise:
+
+```
+ACTUAL mint created in that tx : ['6wZEEcfoMLEjFhMQyckgESYdzPBsdKxmHPWzP4oVMEMe']
+PumpPortal reported mint       : EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v (USDC)
+token mints touched            : {USDC, 6wZEEcfoMLEjFhMQyckgESYdzPBsdKxmHPWzP4oVMEMe}
+```
+
+The launch was real and the name was real. On a **USDC-quoted** LaunchLab pool,
+PumpPortal put the quote asset in the `mint` field instead of the new token. Note
+`solAmount: 0` and `newTokenBalance: 0`, which is the tell: the payload's
+SOL-denominated fields are empty because this pool is not denominated in SOL.
+
+One event in 999, and it would put a row in the dataset asserting that USDC is a
+memecoin that launched on a Tuesday. In a backtest that is not a small error.
+
+**Flagged, deliberately not filtered.** Adding a quote-asset filter is a design
+decision, phase 1 is specified to capture everything without filtering, and the
+instruction for tonight was to bring findings back rather than act on them. So the
+scanner now logs these loudly and stores them exactly as sent:
+
+```
+SUSPECT MINT: feed reported USDC as a new token (sig 3JcSFb..ifRP) - stored unfiltered
+```
+
+Production `scanner.db` currently contains zero rows whose mint is a known quote
+asset, so nothing captured so far is affected.
+
+### TASK B setup: making unattended actually mean unattended
+
+**Reconnect logic has never fired in two sessions.** Waiting for the soak to
+produce a drop would have been hoping, not testing, so it was forced three ways
+before the overnight run started.
+
+```
+TEST 1: unreachable endpoint - backoff must grow
+    backoff sequence: [1.0, 2.0, 4.0, 8.0]
+    connection_events: {'disconnected': 4}
+    [ok] backoff doubles and every failure is recorded
+
+TEST 2: real endpoint, 1s silence watchdog - must fire and recover
+    watchdog fired 5 time(s), reconnected 4 time(s)
+     connected        downtime=None
+     watchdog_fired   downtime=None cause=ConnectionError: no messages for 1s
+     connected        downtime=1.8842442999994091
+     watchdog_fired   downtime=None cause=ConnectionError: no messages for 1s
+     connected        downtime=2.8949868999998216
+    recovery times recorded: [1.88, 2.89, 5.15, 9.35]
+    launches still captured across the churn: 1
+    [ok] watchdog fires, cause logged, recovery timed, ingest resumes
+
+TEST 3: STOP file shuts down a process with no console attached
+    returncode: 0
+    [ok] STOP file stops it gracefully
+```
+
+The growing recovery times in test 2 are correct behaviour, not a fault: each
+connection lived about 2 seconds, well under the 60-second health threshold, so the
+backoff kept escalating exactly as designed.
+
+**Surviving a closed terminal, verified rather than assumed.** A process started
+normally from a terminal belongs to that terminal's console and dies with it.
+`tools/start_soak.py` launches under `pythonw.exe` with `DETACHED_PROCESS`, and the
+launcher exits immediately. Checked, not assumed:
+
+```
+pid         : 2916
+exe         : ...\venv\Scripts\pythonw.exe -u run_scanner.py
+parent      : DEAD - orphaned, terminal close cannot reach it
+window      : 0 (0 = none)
+```
+
+No console, no window, no living parent. There is nothing left for closing a
+terminal to act on.
+
+The trade-off is that a process with no console cannot receive Ctrl+C or
+Ctrl+Break — session 1 already established that `taskkill` without `/F` does
+nothing to a console process either. So the shutdown path is a `STOP` file the
+scanner polls at each status tick, which gives a clean exit: credit meter flushed,
+run row closed, summary printed. `python tools/start_soak.py --stop` writes it and
+waits for the process to go.
+
+### Errors hit
+
+No new failures. Two corrections:
+
+**Credit metering was using the wrong unit.** Session 2 priced Helius WebSocket
+delivery per message. The published rate is **2 credits per 0.1 MB of uncompressed
+streamed data**, so it is billed by volume. The per-message estimate happened to
+land near the right answer by luck. The meter now counts bytes, which is why Task A
+can report 1,595.3 MB and 31,907 credits rather than a guess. There is also no
+documented public endpoint for reading a credit balance — the dashboard is the
+authority, and the reports say so rather than pretending otherwise.
+
+**A test expectation was wrong again, twice**, both in the replay harness rather
+than the code: an assertion that the copied database would contain only Helius rows
+became stale once PumpPortal rows existed, and the unmapped-pool case still used
+`bonk`, which is now a mapped pool. Fixed in the tests.
+
+### Decisions made
+
+**Verify every discrepancy on chain, never trust a raw count.** The whole value of
+Task A rests on the 60 being real. `initializeMint` / `initializeMint2` is the test
+because it is what actually creates a token, and it is independent of both feeds'
+opinions.
+
+**Flag anomalies, do not filter them.** The USDC row, unmapped pools, unknown
+payload shapes and quote-asset mints are all recorded loudly and stored intact.
+Phase 1 captures everything; deciding what to exclude is a later, explicit choice
+and should be made on evidence rather than quietly baked into ingest.
+
+**Record the connection timeline in the database, not just the log file.** A
+`connection_events` table holds every disconnect, watchdog fire and recovery with
+its cause and downtime, so the morning report is a query rather than an exercise in
+grepping.
+
+**Record every distinct payload shape per launchpad.** A `payload_shapes` table
+keyed on the sorted field names, so the first appearance of a new layout is
+announced once and its raw example is kept. The bonk payload already differs from
+the pump one; a third variant must not slip past unnoticed overnight.
+
+### Surprises
+
+- **PumpPortal had a real reconnect during Task A.** `pp_reconnects=1` in a 30-minute window. The feed is not perfectly stable, which makes the soak more interesting than expected.
+- **Every single one of the 60 was genuine.** Going in, the expectation was that a good fraction of the Helius-only set would be false positives like session 1's, and the real gap would shrink to near zero. It did not shrink at all.
+- **Many of the missed launches touch Raydium AMM v4 in the same transaction as pump.fun.** A large share of the 60 show `pumpfun, raydium_amm_v4` rather than pump.fun alone, which hints the misses are not random but concentrated in launches taking some particular route. Not investigated, and not a thing to theorise about without data.
+- **The comparison's own instrument is blunt.** The Helius side missed 6 LaunchLab launches PumpPortal caught, purely because the LaunchLab log marker does not match reliably. The measuring stick has its own gap, which is why the answer is stated as a floor rather than a point estimate.
+- **1.6 GB in thirty minutes.** Seeing the firehose measured in gigabytes rather than message counts makes the cost obvious in a way `msgs 1,366,837` never did.
+
+### Content
+
+`[CONTENT]` **The free feed is missing one launch in eighteen.** On screen: the
+diff result block — `captured by both: 992`, `helius only: 60`, then the
+verification line `verified genuine creations: 60 / NOT creations: 0`. The beat is
+that the obvious explanation, false positives, was tested for and came back zero.
+Then the Solscan links, so the viewer can click through and see a real token that
+the scanner would never have known existed. Ends on the CLAUDE.md line about
+survivorship bias invalidating the backtest.
+
+`[CONTENT]` **PumpPortal said USDC is a new memecoin called MEMEX.** On screen: the
+raw payload with `"mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"` and
+`"symbol": "MEMEX"`, then the chain check showing the actual created mint was
+`6wZEEcfo...MEMe`. One event in 999. The point is what a single bad row does to a
+dataset you plan to bet money against, and that it was only caught because
+something in the diff list looked wrong to the eye.
+
+`[CONTENT]` **Breaking it on purpose, because waiting is not testing.** On screen:
+the backoff sequence `[1.0, 2.0, 4.0, 8.0]` from pointing the scanner at a dead
+endpoint, then the watchdog test output with real recovery times
+`[1.88, 2.89, 5.15, 9.35]`. Reconnect logic had existed for two sessions and never
+run once. The framing: code that has never executed is not working code, it is
+untested code that happens to compile.
+
+`[CONTENT]` **Proving the process is genuinely orphaned.** On screen:
+`parent : DEAD - orphaned, terminal close cannot reach it` and `window : 0 (0 =
+none)`. Short and satisfying: the instruction was "verify it, don't assume it", and
+the verification is three lines showing there is nothing left for a closing
+terminal to kill.
+
+**Time:** roughly 1h10m for Task A and the soak setup. Task B runs overnight.
+
+**Next:** the soak result in the morning — reconnects, launchpad breakdown, any new
+payload shapes. Then two open questions to decide together, not unilaterally: what
+to do about the 5.7% coverage gap, and whether ingest should reject events whose
+mint is a known quote asset.
